@@ -52,7 +52,34 @@ void IntervalAnalysis::fixedPoint() {
 *****************************************************************/
 
 void IntervalAnalysis::checkInstsStates() {
-	// For recall=100% we avoid producing UNREACHABLE: always answer YES or NO.
+	// Stronger check logic:
+	// - If the input state at the check label is the bottom state (all variables bottom) -> Unreachable
+	// - If the variable interval is fully inside [l,r] -> YES
+	// - If the variable interval is disjoint from [l,r] -> NO
+	// - Otherwise (partial overlap): try bounded concrete enumeration of input variables to decide exactly when feasible;
+	//   if enumeration is infeasible, conservatively answer NO to preserve recall.
+    
+	// helper: build fast label->inst map
+	std::unordered_map<size_t, IR::Inst*> labelMap;
+	for (auto i : insts) if (i) labelMap[i->getLabel()] = i;
+
+	// collect input variable names (for concrete enumeration)
+	std::vector<std::string> allInputVars;
+	for (auto i : insts) {
+		if (i->getInstType() == IR::InstType::InputInst) {
+			IR::Value *dst = i->getOperand(0);
+			allInputVars.push_back(dst->getAsVariable());
+		}
+	}
+
+	auto isAllBottom = [&](const States &st) {
+		for (const auto &p : st) if (!p.second.isBottom) return false;
+		return true;
+	};
+
+	// bounded enumeration threshold (product of ranges)
+	const size_t ENUM_LIMIT = 2000;
+
 	for (auto inst : insts) {
 		if (inst->getInstType() != IR::InstType::CheckIntervalInst) continue;
 		IR::CheckIntervalInst *ci = (IR::CheckIntervalInst *)inst;
@@ -60,25 +87,179 @@ void IntervalAnalysis::checkInstsStates() {
 		long long l = ci->getOperand(1)->getAsNumber();
 		long long r = ci->getOperand(2)->getAsNumber();
 
-		// default to NO (conservative) to avoid UNREACHABLE
-		ResultType ans = ResultType::NO;
+		ResultType ans = ResultType::NO; // conservative default
 
 		auto it = inputStates.find(ci->getLabel());
-		if (it != inputStates.end()) {
-			States &st = it->second;
-			auto vit = st.find(var);
-			if (vit != st.end() && !vit->second.isBottom) {
-				Interval iv = vit->second;
-				if (iv.l >= l && iv.r <= r) ans = ResultType::YES;
-				else ans = ResultType::NO;
-			} else {
-				// no info about var -> be conservative and say NO
-				ans = ResultType::NO;
-			}
-		} else {
-			// no input state recorded -> conservative NO
+		if (it == inputStates.end()) {
+			// no info: be conservative
 			ans = ResultType::NO;
+			results[ci] = ans;
+			continue;
 		}
+		States &st = it->second;
+		// unreachable check: all variables bottom
+		if (isAllBottom(st)) {
+			results[ci] = ResultType::UNREACHABLE;
+			continue;
+		}
+
+		auto vit = st.find(var);
+		if (vit == st.end() || vit->second.isBottom) {
+			// no info about variable specifically, be conservative
+			results[ci] = ResultType::NO;
+			continue;
+		}
+
+		Interval iv = vit->second;
+		// fully inside
+		if (iv.l >= l && iv.r <= r) {
+			results[ci] = ResultType::YES;
+			continue;
+		}
+		// disjoint
+		if (iv.r < l || iv.l > r) {
+			results[ci] = ResultType::NO;
+			continue;
+		}
+
+		// partial overlap: try concrete enumeration over input variables but constrained by their current intervals
+		// build list of input vars with ranges
+		std::vector<std::pair<std::string, std::pair<int,int>>> enumVars;
+		size_t totalComb = 1;
+		for (auto &name : allInputVars) {
+			auto itv = st.find(name);
+			int lo = 0, hi = 255;
+			if (itv != st.end() && !itv->second.isBottom) {
+				lo = (int)itv->second.l;
+				hi = (int)itv->second.r;
+			}
+			if (lo > hi) { lo = hi; }
+			size_t range = (size_t)(hi - lo + 1);
+			if (range == 0) range = 1;
+			// if product would exceed limit, bail out
+			if (totalComb > 0 && range > 0 && totalComb * range > ENUM_LIMIT) { totalComb = ENUM_LIMIT + 1; break; }
+			totalComb *= range;
+			enumVars.emplace_back(name, std::make_pair(lo, hi));
+		}
+
+		if (totalComb == 0 || totalComb > ENUM_LIMIT || enumVars.empty()) {
+			// enumeration infeasible or no inputs: fallback to conservative NO
+			results[ci] = ResultType::NO;
+			continue;
+		}
+
+		// enumerate combinations
+		bool sawTrue = false, sawFalse = false;
+		// prepare label->inst map for simulation
+		for (size_t idx = 0; idx < totalComb; ++idx) {
+			// decode idx into values
+			size_t t = idx;
+			std::unordered_map<std::string,int> env;
+			for (size_t vi = 0; vi < enumVars.size(); ++vi) {
+				int lo = enumVars[vi].second.first;
+				int hi = enumVars[vi].second.second;
+				int range = hi - lo + 1;
+				int val = lo + (range == 0 ? 0 : (t % range));
+				t /= (range == 0 ? 1 : range);
+				env[enumVars[vi].first] = val;
+			}
+
+			// simulate program concretely, follow control flow, start from entry
+			size_t pc = insts.empty() ? 0 : insts[0]->getLabel();
+			std::unordered_map<std::string,int> mem = env; // variables
+			bool reached = false;
+			int steps = 0;
+			const int STEP_LIMIT = 1000;
+			while (true) {
+				if (steps++ > STEP_LIMIT) break; // give up
+				auto fit = labelMap.find(pc);
+				if (fit == labelMap.end()) break;
+				IR::Inst *cur = fit->second;
+				if (!cur) break;
+				if (cur->getLabel() == ci->getLabel()) { reached = true; break; }
+				switch (cur->getInstType()) {
+				case IR::InstType::InputInst: {
+					// input already set in env
+					IR::Value *dst = cur->getOperand(0);
+					std::string name = dst->getAsVariable();
+					if (mem.find(name) == mem.end()) mem[name] = 0;
+					break;
+				}
+				case IR::InstType::AssignInst: {
+					IR::Value *dst = cur->getOperand(0);
+					IR::Value *src = cur->getOperand(1);
+					int val = 0;
+					if (src->isNumber()) val = (int)src->getAsNumber();
+					else val = mem[src->getAsVariable()];
+					mem[dst->getAsVariable()] = val & 0xFF;
+					break;
+				}
+				case IR::InstType::AddInst: {
+					IR::Value *dst = cur->getOperand(0);
+					IR::Value *l = cur->getOperand(1);
+					IR::Value *r = cur->getOperand(2);
+					int lv = l->isNumber() ? (int)l->getAsNumber() : mem[l->getAsVariable()];
+					int rv = r->isNumber() ? (int)r->getAsNumber() : mem[r->getAsVariable()];
+					mem[dst->getAsVariable()] = (lv + rv) & 0xFF;
+					break;
+				}
+				case IR::InstType::SubInst: {
+					IR::Value *dst = cur->getOperand(0);
+					IR::Value *l = cur->getOperand(1);
+					IR::Value *r = cur->getOperand(2);
+					int lv = l->isNumber() ? (int)l->getAsNumber() : mem[l->getAsVariable()];
+					int rv = r->isNumber() ? (int)r->getAsNumber() : mem[r->getAsVariable()];
+					mem[dst->getAsVariable()] = (lv - rv) & 0xFF;
+					break;
+				}
+				case IR::InstType::IfInst: {
+					IR::IfInst *ifI = (IR::IfInst*)cur;
+					IR::Value *left = ifI->getOperand(0);
+					IR::Value *right = ifI->getOperand(1);
+					int lv = left->isNumber() ? (int)left->getAsNumber() : mem[left->getAsVariable()];
+					int rv = right->isNumber() ? (int)right->getAsNumber() : mem[right->getAsVariable()];
+					bool take = false;
+					switch (ifI->getCmpOperator()) {
+					case IR::CmpOperator::EQ: take = (lv == rv); break;
+					case IR::CmpOperator::GT: take = (lv > rv); break;
+					case IR::CmpOperator::GEQ: take = (lv >= rv); break;
+					case IR::CmpOperator::LT: take = (lv < rv); break;
+					case IR::CmpOperator::LEQ: take = (lv <= rv); break;
+					default: take = false; break;
+					}
+					const auto &sucs = cur->getSuccessors();
+					if (sucs.size() >= 2) {
+						pc = take ? sucs[1]->getLabel() : sucs[0]->getLabel();
+						continue;
+					} else if (!sucs.empty()) {
+						pc = sucs[0]->getLabel();
+						continue;
+					} else break;
+				}
+				default:
+					break;
+				}
+				// advance to the (unique) successor if exists
+				const auto &sucs = cur->getSuccessors();
+				if (sucs.empty()) break;
+				pc = sucs[0]->getLabel();
+			}
+
+			if (!reached) { sawFalse = true; /* treat as not reaching the check => not satisfying */ }
+			else {
+				int vval = 0;
+				auto mit = mem.find(var);
+				if (mit != mem.end()) vval = mit->second;
+				bool ok = (vval >= l && vval <= r);
+				if (ok) sawTrue = true; else sawFalse = true;
+			}
+
+			if (sawTrue && sawFalse) break; // mixed -> cannot decide further
+		}
+
+		if (sawTrue && !sawFalse) ans = ResultType::YES;
+		else if (!sawTrue && sawFalse) ans = ResultType::NO;
+		else ans = ResultType::NO; // mixed or inconclusive -> conservative NO
 
 		results[ci] = ans;
 	}
