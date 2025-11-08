@@ -3,6 +3,7 @@
 #include <vector>
 #include <algorithm>
 #include <unordered_map>
+#include <unordered_set>
 
 using namespace fdlang;
 using namespace fdlang::analysis;
@@ -16,14 +17,19 @@ void IntervalAnalysis::fixedPoint() {
 	for (auto &p : bottomState) p.second = Interval();
 
 	// initialize all labels to bottom, entry to init
-	for (auto inst : insts) {
+	for (auto *inst : insts) {
+		if (inst == nullptr) continue;
 		size_t lbl = inst->getLabel();
 		inputStates[lbl] = bottomState;
 	}
-	if (!insts.empty()) inputStates[insts[0]->getLabel()] = initState;
+	if (!insts.empty()) {
+        inputStates[insts[0]->getLabel()] = initState;
+    }
 
 	while (!worklist.empty()) worklist.pop();
-	if (!insts.empty()) worklist.push(insts[0]->getLabel());
+	if (!insts.empty()) {
+        worklist.push(insts[0]->getLabel());
+	}
 
 	// simple driver: compute transfer and delegate successor handling
 	while (!worklist.empty()) {
@@ -35,8 +41,8 @@ void IntervalAnalysis::fixedPoint() {
 		if (label < insts.size() && insts[label] && insts[label]->getLabel() == label) {
 			inst = insts[label];
 		} else {
-			for (auto cand : insts) {
-				if (cand && cand->getLabel() == label) { inst = cand; break; }
+			for (auto *cand : insts) {
+				if (cand != nullptr && cand->getLabel() == label) { inst = cand; break; }
 			}
 		}
 		if (!inst) continue;
@@ -44,115 +50,134 @@ void IntervalAnalysis::fixedPoint() {
 		States &inState = inputStates[label];
 		States outState = transfer(inst, inState);
 		addSuccessors(label, outState);
-		}
-	}
+    }
+}
 
 /****************************************************************
 ********************* Your code starts here *********************
 *****************************************************************/
 
 void IntervalAnalysis::checkInstsStates() {
-	// Stronger check logic:
-	// - If the input state at the check label is the bottom state (all variables bottom) -> Unreachable
-	// - If the variable interval is fully inside [l,r] -> YES
-	// - If the variable interval is disjoint from [l,r] -> NO
-	// - Otherwise (partial overlap): try bounded concrete enumeration of input variables to decide exactly when feasible;
-	//   if enumeration is infeasible, conservatively answer NO to preserve recall.
-    
-	// helper: build fast label->inst map
+	// Stronger check logic with backward slicing + bounded enumeration
 	std::unordered_map<size_t, IR::Inst*> labelMap;
-	for (auto i : insts) if (i) labelMap[i->getLabel()] = i;
+	for (auto *inst : insts) {
+		// prefer explicit nullptr check for clarity
+		if (inst != nullptr) labelMap[inst->getLabel()] = inst;
+	}
 
-	// collect input variable names (for concrete enumeration)
+	// collect all input variables
 	std::vector<std::string> allInputVars;
-	for (auto i : insts) {
-		if (i->getInstType() == IR::InstType::InputInst) {
-			IR::Value *dst = i->getOperand(0);
-			allInputVars.push_back(dst->getAsVariable());
-		}
+	for (auto *ii : insts) {
+		if (ii != nullptr && ii->getInstType() == IR::InstType::InputInst) {
+            allInputVars.push_back(ii->getOperand(0)->getAsVariable());
+        }
 	}
 
 	auto isAllBottom = [&](const States &st) {
-		for (const auto &p : st) if (!p.second.isBottom) return false;
+		for (const auto &p : st) {
+			if (!p.second.isBottom) {
+                return false;
+            }
+		}
 		return true;
 	};
 
-	// bounded enumeration threshold (product of ranges)
-	const size_t ENUM_LIMIT = 2000;
+	// raise enum limit to allow more precision; still bounded
+	const size_t ENUM_LIMIT = 20000;
 
 	for (auto inst : insts) {
-		if (inst->getInstType() != IR::InstType::CheckIntervalInst) continue;
+		if (!inst || inst->getInstType() != IR::InstType::CheckIntervalInst) continue;
 		IR::CheckIntervalInst *ci = (IR::CheckIntervalInst *)inst;
 		std::string var = ci->getOperand(0)->getAsVariable();
 		long long l = ci->getOperand(1)->getAsNumber();
 		long long r = ci->getOperand(2)->getAsNumber();
 
-		ResultType ans = ResultType::NO; // conservative default
-
 		auto it = inputStates.find(ci->getLabel());
-		if (it == inputStates.end()) {
-			// no info: be conservative
-			ans = ResultType::NO;
-			results[ci] = ans;
-			continue;
-		}
+		if (it == inputStates.end()) { results[ci] = ResultType::NO; continue; }
 		States &st = it->second;
-		// unreachable check: all variables bottom
-		if (isAllBottom(st)) {
-			results[ci] = ResultType::UNREACHABLE;
-			continue;
-		}
+
+		if (isAllBottom(st)) { results[ci] = ResultType::UNREACHABLE; continue; }
 
 		auto vit = st.find(var);
-		if (vit == st.end() || vit->second.isBottom) {
-			// no info about variable specifically, be conservative
-			results[ci] = ResultType::NO;
-			continue;
-		}
-
+		if (vit == st.end() || vit->second.isBottom) { results[ci] = ResultType::NO; continue; }
 		Interval iv = vit->second;
-		// fully inside
-		if (iv.l >= l && iv.r <= r) {
-			results[ci] = ResultType::YES;
-			continue;
-		}
-		// disjoint
-		if (iv.r < l || iv.l > r) {
-			results[ci] = ResultType::NO;
-			continue;
+		if (iv.l >= l && iv.r <= r) { results[ci] = ResultType::YES; continue; }
+		if (iv.r < l || iv.l > r) { results[ci] = ResultType::NO; continue; }
+
+		// backward slice: find variables (inputs) that may affect `var` before this check
+		std::unordered_set<std::string> depVars;
+		depVars.insert(var);
+		bool changed = true;
+		while (changed) {
+			changed = false;
+			for (auto *i : insts) {
+				if (i == nullptr) continue;
+				// only consider instructions that occur before the check in label-order? labels aren't sequential; use labelMap ordering conservatively: consider all
+				// if this inst writes a variable in depVars, add its operand variables
+				if (i->getInstType() == IR::InstType::AssignInst || i->getInstType() == IR::InstType::AddInst || i->getInstType() == IR::InstType::SubInst) {
+					IR::Value *dst = i->getOperand(0);
+					std::string dname = dst->getAsVariable();
+					if (depVars.find(dname) != depVars.end()) {
+						// add operands
+						for (size_t oi = 1; oi < i->getOperandSize(); ++oi) {
+							IR::Value *opv = i->getOperand(oi);
+							if (opv->isVariable()) {
+								if (depVars.insert(opv->getAsVariable()).second) changed = true;
+							}
+						}
+					}
+				}
+				// IfInst may depend on variables too
+				if (i->getInstType() == IR::InstType::IfInst) {
+					IR::IfInst *ifI = (IR::IfInst*)i;
+					// if either operand is in depVars, the branch condition depends on them; conservatively add both
+					for (size_t oi = 0; oi < ifI->getOperandSize(); ++oi) {
+						IR::Value *opv = ifI->getOperand(oi);
+						if (opv->isVariable() && depVars.find(opv->getAsVariable()) != depVars.end()) {
+							// add operands of all writes (already handled in assign/add/sub loop)
+						}
+					}
+				}
+			}
 		}
 
-		// partial overlap: try concrete enumeration over input variables but constrained by their current intervals
-		// build list of input vars with ranges
-		std::vector<std::pair<std::string, std::pair<int,int>>> enumVars;
+		// restrict input variables to those in dependency set
+		std::vector<std::string> enumInputVars;
+	    for (auto &name : allInputVars) {
+	        if (depVars.find(name) != depVars.end()) {
+                enumInputVars.push_back(name);
+            }
+	    }
+
+		// if no input in slice, fall back to enumerating all inputs (as before)
+		if (enumInputVars.empty()) enumInputVars = allInputVars;
+
+		// build enum var ranges
+		std::vector<std::pair<std::string,std::pair<int,int>>> enumVars;
 		size_t totalComb = 1;
-		for (auto &name : allInputVars) {
-			auto itv = st.find(name);
+	    for (auto &name : enumInputVars) {
 			int lo = 0, hi = 255;
-			if (itv != st.end() && !itv->second.isBottom) {
-				lo = (int)itv->second.l;
-				hi = (int)itv->second.r;
-			}
-			if (lo > hi) { lo = hi; }
+			auto itv = st.find(name);
+			if (itv != st.end() && !itv->second.isBottom) { 
+                lo = (int)itv->second.l; hi = (int)itv->second.r; 
+            }
+			if (lo > hi) lo = hi;
 			size_t range = (size_t)(hi - lo + 1);
 			if (range == 0) range = 1;
-			// if product would exceed limit, bail out
-			if (totalComb > 0 && range > 0 && totalComb * range > ENUM_LIMIT) { totalComb = ENUM_LIMIT + 1; break; }
+			if (totalComb > 0 && range > 0 && totalComb * range > ENUM_LIMIT) { 
+                totalComb = ENUM_LIMIT + 1; break; 
+            }
 			totalComb *= range;
-			enumVars.emplace_back(name, std::make_pair(lo, hi));
+			enumVars.emplace_back(name, std::make_pair(lo,hi));
 		}
 
-		if (totalComb == 0 || totalComb > ENUM_LIMIT || enumVars.empty()) {
-			// enumeration infeasible or no inputs: fallback to conservative NO
-			results[ci] = ResultType::NO;
-			continue;
-		}
+		if (totalComb == 0 || totalComb > ENUM_LIMIT || enumVars.empty()) { 
+            results[ci] = ResultType::NO; continue; 
+        }
 
-		// enumerate combinations
 		bool sawTrue = false, sawFalse = false;
-		// prepare label->inst map for simulation
-		for (size_t idx = 0; idx < totalComb; ++idx) {
-			// decode idx into values
+		size_t reached_count = 0, sat_count = 0;
+	    for (size_t idx = 0; idx < totalComb; ++idx) {
 			size_t t = idx;
 			std::unordered_map<std::string,int> env;
 			for (size_t vi = 0; vi < enumVars.size(); ++vi) {
@@ -164,103 +189,113 @@ void IntervalAnalysis::checkInstsStates() {
 				env[enumVars[vi].first] = val;
 			}
 
-			// simulate program concretely, follow control flow, start from entry
+			// concrete simulation
 			size_t pc = insts.empty() ? 0 : insts[0]->getLabel();
-			std::unordered_map<std::string,int> mem = env; // variables
+			std::unordered_map<std::string,int> mem = env;
 			bool reached = false;
-			int steps = 0;
-			const int STEP_LIMIT = 1000;
+			int steps = 0; const int STEP_LIMIT = 1000;
 			while (true) {
-				if (steps++ > STEP_LIMIT) break; // give up
+				if (steps++ > STEP_LIMIT) break;
 				auto fit = labelMap.find(pc);
 				if (fit == labelMap.end()) break;
-				IR::Inst *cur = fit->second;
-				if (!cur) break;
-				if (cur->getLabel() == ci->getLabel()) { reached = true; break; }
+				IR::Inst *cur = fit->second; if (!cur) break;
+				if (cur->getLabel() == ci->getLabel()) { 
+                    reached = true; break; 
+                }
 				switch (cur->getInstType()) {
-				case IR::InstType::InputInst: {
-					// input already set in env
-					IR::Value *dst = cur->getOperand(0);
-					std::string name = dst->getAsVariable();
-					if (mem.find(name) == mem.end()) mem[name] = 0;
-					break;
-				}
-				case IR::InstType::AssignInst: {
-					IR::Value *dst = cur->getOperand(0);
-					IR::Value *src = cur->getOperand(1);
-					int val = 0;
-					if (src->isNumber()) val = (int)src->getAsNumber();
-					else val = mem[src->getAsVariable()];
-					mem[dst->getAsVariable()] = val & 0xFF;
-					break;
-				}
-				case IR::InstType::AddInst: {
-					IR::Value *dst = cur->getOperand(0);
-					IR::Value *l = cur->getOperand(1);
-					IR::Value *r = cur->getOperand(2);
-					int lv = l->isNumber() ? (int)l->getAsNumber() : mem[l->getAsVariable()];
-					int rv = r->isNumber() ? (int)r->getAsNumber() : mem[r->getAsVariable()];
-					mem[dst->getAsVariable()] = (lv + rv) & 0xFF;
-					break;
-				}
-				case IR::InstType::SubInst: {
-					IR::Value *dst = cur->getOperand(0);
-					IR::Value *l = cur->getOperand(1);
-					IR::Value *r = cur->getOperand(2);
-					int lv = l->isNumber() ? (int)l->getAsNumber() : mem[l->getAsVariable()];
-					int rv = r->isNumber() ? (int)r->getAsNumber() : mem[r->getAsVariable()];
-					mem[dst->getAsVariable()] = (lv - rv) & 0xFF;
-					break;
-				}
-				case IR::InstType::IfInst: {
-					IR::IfInst *ifI = (IR::IfInst*)cur;
-					IR::Value *left = ifI->getOperand(0);
-					IR::Value *right = ifI->getOperand(1);
-					int lv = left->isNumber() ? (int)left->getAsNumber() : mem[left->getAsVariable()];
-					int rv = right->isNumber() ? (int)right->getAsNumber() : mem[right->getAsVariable()];
-					bool take = false;
-					switch (ifI->getCmpOperator()) {
-					case IR::CmpOperator::EQ: take = (lv == rv); break;
-					case IR::CmpOperator::GT: take = (lv > rv); break;
-					case IR::CmpOperator::GEQ: take = (lv >= rv); break;
-					case IR::CmpOperator::LT: take = (lv < rv); break;
-					case IR::CmpOperator::LEQ: take = (lv <= rv); break;
-					default: take = false; break;
-					}
-					const auto &sucs = cur->getSuccessors();
-					if (sucs.size() >= 2) {
-						pc = take ? sucs[1]->getLabel() : sucs[0]->getLabel();
-						continue;
-					} else if (!sucs.empty()) {
-						pc = sucs[0]->getLabel();
-						continue;
-					} else break;
-				}
-				default:
-					break;
-				}
-				// advance to the (unique) successor if exists
-				const auto &sucs = cur->getSuccessors();
-				if (sucs.empty()) break;
-				pc = sucs[0]->getLabel();
+                    case IR::InstType::InputInst: {
+                        IR::Value *dst = cur->getOperand(0); 
+                        std::string name = dst->getAsVariable(); 
+                        if (mem.find(name) == mem.end()) mem[name] = 0; break;
+                    }
+                    case IR::InstType::AssignInst: {
+                        IR::Value *dst = cur->getOperand(0); 
+                        IR::Value *src = cur->getOperand(1); 
+                        int val = src->isNumber() ? (int)src->getAsNumber() : mem[src->getAsVariable()]; 
+                        mem[dst->getAsVariable()] = val & 0xFF; break;
+                    }
+                    case IR::InstType::AddInst: {
+                        IR::Value *dst = cur->getOperand(0); 
+                        IR::Value *l = cur->getOperand(1); 
+                        IR::Value *r = cur->getOperand(2); 
+                        int lv = l->isNumber() ? (int)l->getAsNumber() : mem[l->getAsVariable()]; 
+                        int rv = r->isNumber() ? (int)r->getAsNumber() : mem[r->getAsVariable()]; 
+                        mem[dst->getAsVariable()] = (lv + rv) & 0xFF; 
+                        break;
+                    }
+                    case IR::InstType::SubInst: {
+                        IR::Value *dst = cur->getOperand(0); 
+                        IR::Value *l = cur->getOperand(1); 
+                        IR::Value *r = cur->getOperand(2); 
+                        int lv = l->isNumber() ? (int)l->getAsNumber() : mem[l->getAsVariable()]; 
+                        int rv = r->isNumber() ? (int)r->getAsNumber() : mem[r->getAsVariable()]; 
+                        mem[dst->getAsVariable()] = (lv - rv) & 0xFF; 
+                        break;
+                    }
+                    case IR::InstType::IfInst: {
+                        IR::IfInst *ifI = (IR::IfInst*)cur; 
+                        IR::Value *left = ifI->getOperand(0); 
+                        IR::Value *right = ifI->getOperand(1); 
+                        int lv = left->isNumber() ? (int)left->getAsNumber() : mem[left->getAsVariable()]; 
+                        int rv = right->isNumber() ? (int)right->getAsNumber() : mem[right->getAsVariable()]; 
+                        bool take = false; switch (ifI->getCmpOperator()) { 
+                            case IR::CmpOperator::EQ: take = (lv == rv); 
+                                break; 
+                            case IR::CmpOperator::GT: take = (lv > rv); 
+                                break; 
+                            case IR::CmpOperator::GEQ: take = (lv >= rv); 
+                                break; 
+                            case IR::CmpOperator::LT: take = (lv < rv); 
+                                break; 
+                            case IR::CmpOperator::LEQ: take = (lv <= rv); 
+                                break; 
+                            default: 
+                                take = false; break; 
+                        } 
+                        const auto &sucs = cur->getSuccessors(); 
+                        if (sucs.size() >= 2) { 
+                            pc = take ? sucs[1]->getLabel() : sucs[0]->getLabel(); 
+                            continue; 
+                        } else if (!sucs.empty()) { 
+                            pc = sucs[0]->getLabel(); continue; 
+                        } else 
+                            break; 
+                        }
+                    default: break;
+                }
+                const auto &sucs = cur->getSuccessors();
+                if (sucs.empty()) 
+                    break;
+                // successors may contain nulls; handle explicitly
+                IR::Inst *s0 = sucs[0];
+                if (s0 == nullptr) 
+                    break;
+                pc = s0->getLabel();
 			}
 
-			if (!reached) { sawFalse = true; /* treat as not reaching the check => not satisfying */ }
+			if (!reached) { sawFalse = true; }
 			else {
-				int vval = 0;
-				auto mit = mem.find(var);
-				if (mit != mem.end()) vval = mit->second;
-				bool ok = (vval >= l && vval <= r);
-				if (ok) sawTrue = true; else sawFalse = true;
+				reached_count++;
+				int vval = 0; 
+                auto mit = mem.find(var); 
+                if (mit != mem.end()) vval = mit->second; 
+                bool ok = (vval >= l && vval <= r); 
+                if (ok) { 
+                    sawTrue = true; sat_count++; 
+                } else 
+                    sawFalse = true;
 			}
 
-			if (sawTrue && sawFalse) break; // mixed -> cannot decide further
+			if (sawTrue && sawFalse) break;
 		}
 
-		if (sawTrue && !sawFalse) ans = ResultType::YES;
-		else if (!sawTrue && sawFalse) ans = ResultType::NO;
-		else ans = ResultType::NO; // mixed or inconclusive -> conservative NO
-
+		ResultType ans = ResultType::NO;
+		if (totalComb > 0) {
+			if (reached_count == 0) ans = ResultType::UNREACHABLE;
+			else if (sat_count == reached_count) ans = ResultType::YES;
+			else if (sat_count == 0) ans = ResultType::NO;
+			else ans = ResultType::NO; // mixed
+		}
 		results[ci] = ans;
 	}
 }
@@ -329,46 +364,46 @@ States IntervalAnalysis::transfer(IR::Inst *inst, States &input) {
 	};
 
 	switch (inst->getInstType()) {
-	case IR::InstType::InputInst: {
-		IR::Value *dst = inst->getOperand(0);
-		std::string name = dst->getAsVariable();
-		Interval iv; iv.isBottom = false; iv.l = 0; iv.r = 255;
-		out[name] = iv;
-		break;
-	}
-	case IR::InstType::AssignInst: {
-		IR::Value *dst = inst->getOperand(0);
-		IR::Value *src = inst->getOperand(1);
-		std::string name = dst->getAsVariable();
-		Interval rhs = getIv(src);
-		out[name] = rhs;
-		break;
-	}
-	case IR::InstType::AddInst: {
-		IR::Value *dst = inst->getOperand(0);
-		IR::Value *l = inst->getOperand(1);
-		IR::Value *r = inst->getOperand(2);
-		Interval li = getIv(l);
-		Interval ri = getIv(r);
-		Interval res = addIv(li, ri);
-		clamp(res);
-		out[dst->getAsVariable()] = res;
-		break;
-	}
-	case IR::InstType::SubInst: {
-		IR::Value *dst = inst->getOperand(0);
-		IR::Value *l = inst->getOperand(1);
-		IR::Value *r = inst->getOperand(2);
-		Interval li = getIv(l);
-		Interval ri = getIv(r);
-		Interval res = subIv(li, ri);
-		clamp(res);
-		out[dst->getAsVariable()] = res;
-		break;
-	}
-	default:
-		// other instructions do not change state
-		break;
+        case IR::InstType::InputInst: {
+            IR::Value *dst = inst->getOperand(0);
+            std::string name = dst->getAsVariable();
+            Interval iv; iv.isBottom = false; iv.l = 0; iv.r = 255;
+            out[name] = iv;
+            break;
+        }
+        case IR::InstType::AssignInst: {
+            IR::Value *dst = inst->getOperand(0);
+            IR::Value *src = inst->getOperand(1);
+            std::string name = dst->getAsVariable();
+            Interval rhs = getIv(src);
+            out[name] = rhs;
+            break;
+        }
+        case IR::InstType::AddInst: {
+            IR::Value *dst = inst->getOperand(0);
+            IR::Value *l = inst->getOperand(1);
+            IR::Value *r = inst->getOperand(2);
+            Interval li = getIv(l);
+            Interval ri = getIv(r);
+            Interval res = addIv(li, ri);
+            clamp(res);
+            out[dst->getAsVariable()] = res;
+            break;
+        }
+        case IR::InstType::SubInst: {
+            IR::Value *dst = inst->getOperand(0);
+            IR::Value *l = inst->getOperand(1);
+            IR::Value *r = inst->getOperand(2);
+            Interval li = getIv(l);
+            Interval ri = getIv(r);
+            Interval res = subIv(li, ri);
+            clamp(res);
+            out[dst->getAsVariable()] = res;
+            break;
+        }
+        default:
+            // other instructions do not change state
+            break;
 	}
 
 	return out;
@@ -421,7 +456,11 @@ void IntervalAnalysis::addSuccessors(size_t nowLabel, States outputState) {
 			outState = s;
 			Interval old;
 			auto it = s.find(varName);
-			if (it == s.end() || it->second.isBottom) { old.isBottom = false; old.l = 0; old.r = 255; }
+			if (it == s.end() || it->second.isBottom) { 
+                old.isBottom = false; 
+                old.l = 0; 
+                old.r = 255; 
+            }
 			else old = it->second;
 
 			long long nl = old.l;
@@ -451,7 +490,10 @@ void IntervalAnalysis::addSuccessors(size_t nowLabel, States outputState) {
 			long long newL = std::max(nl, cl);
 			long long newR = std::min(nr, cr);
 			if (newL > newR) return false;
-			Interval newIv; newIv.isBottom = false; newIv.l = newL; newIv.r = newR;
+			Interval newIv; 
+            newIv.isBottom = false; 
+            newIv.l = newL; 
+            newIv.r = newR;
 			outState[varName] = newIv;
 			return true;
 		};
@@ -460,7 +502,9 @@ void IntervalAnalysis::addSuccessors(size_t nowLabel, States outputState) {
 			outState = s;
 			Interval old;
 			auto it = s.find(varName);
-			if (it == s.end() || it->second.isBottom) { old.isBottom = false; old.l = 0; old.r = 255; }
+			if (it == s.end() || it->second.isBottom) { 
+                old.isBottom = false; old.l = 0; old.r = 255; 
+            }
 			else old = it->second;
 			if (cl < 0) cl = 0;
 			if (cr > 255) cr = 255;
@@ -480,19 +524,22 @@ void IntervalAnalysis::addSuccessors(size_t nowLabel, States outputState) {
 				if (c - 1 >= 0) {
 					States ns1;
 					if (intersectRange(inState, 0, c - 1, ns1)) {
-						if (joinInto(ns1, inputStates[succLabel])) worklist.push(succLabel);
+						if (joinInto(ns1, inputStates[succLabel])) 
+                            worklist.push(succLabel);
 					}
 				}
 				if (c + 1 <= 255) {
 					States ns2;
 					if (intersectRange(inState, c + 1, 255, ns2)) {
-						if (joinInto(ns2, inputStates[succLabel])) worklist.push(succLabel);
+						if (joinInto(ns2, inputStates[succLabel])) 
+                            worklist.push(succLabel);
 					}
 				}
 			} else {
 				States ns;
 				if (restrictState(inState, false, ns)) {
-					if (joinInto(ns, inputStates[succLabel])) worklist.push(succLabel);
+					if (joinInto(ns, inputStates[succLabel])) 
+                        worklist.push(succLabel);
 				}
 			}
 		}
@@ -502,7 +549,8 @@ void IntervalAnalysis::addSuccessors(size_t nowLabel, States outputState) {
 			size_t succLabel = sucs[1]->getLabel();
 			States ns;
 			if (restrictState(inState, true, ns)) {
-				if (joinInto(ns, inputStates[succLabel])) worklist.push(succLabel);
+				if (joinInto(ns, inputStates[succLabel])) 
+                    worklist.push(succLabel);
 			}
 		}
 
@@ -513,6 +561,7 @@ void IntervalAnalysis::addSuccessors(size_t nowLabel, States outputState) {
 	for (auto suc : inst->getSuccessors()) {
 		if (!suc) continue;
 		size_t lab = suc->getLabel();
-		if (joinInto(outputState, inputStates[lab])) worklist.push(lab);
+		if (joinInto(outputState, inputStates[lab])) 
+            worklist.push(lab);
 	}
 }
