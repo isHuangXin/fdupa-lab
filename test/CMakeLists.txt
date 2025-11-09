@@ -1,6 +1,8 @@
 add_custom_target(unit_tests)
 set(TESTCASES_DIR ${PROJECT_ROOT_DIR}/testcases)
+set(TESTCASES_DIR_MYSELF ${PROJECT_ROOT_DIR}/testcases_myself)
 add_definitions(-DTESTCASES_DIR=\"${TESTCASES_DIR}\")
+add_definitions(-DTESTCASES_DIR_MYSELF=\"${TESTCASES_DIR_MYSELF}\")
 
 file(GLOB_RECURSE SOURCES *.cpp)
 

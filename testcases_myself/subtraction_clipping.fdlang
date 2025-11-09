@@ -1,0 +1,6 @@
+function test2(){
+    a = 5;
+    b = 7;
+    c = a - b;
+    check_interval(c, 0, 0);
+}
