@@ -24,6 +24,14 @@ struct Interval {
 // variable -> value
 using States = std::map<std::string, Interval>;
 
+// Helper functions used by IntervalAnalysis implementation.
+// Declared here so tests and other translation units can reference.
+// Definitions are in intervalAnalysis.cpp
+Interval getIvFromValue(IR::Value *v, const States &input);
+void clampInterval(Interval &iv);
+Interval addInterval(const Interval &a, const Interval &b);
+Interval subInterval(const Interval &a, const Interval &b);
+
 class IntervalAnalysis : public DataflowAnalysis {
 public:
     enum class ResultType { YES, NO, UNREACHABLE };
