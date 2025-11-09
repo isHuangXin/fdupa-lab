@@ -326,12 +326,15 @@ States IntervalAnalysis::iniStates() {
 States IntervalAnalysis::transfer(IR::Inst *inst, States &input) {
 	States out = input; // default copy
 
-	// Use helper functions defined above.
+	// Use helper functions defined below.
 	switch (inst->getInstType()) {
         case IR::InstType::InputInst: {
             IR::Value *dst = inst->getOperand(0);
             std::string name = dst->getAsVariable();
-            Interval iv; iv.isBottom = false; iv.l = 0; iv.r = 255;
+            Interval iv; 
+            iv.isBottom = false; 
+            iv.l = 0; 
+            iv.r = 255;
             out[name] = iv;
             break;
         }
@@ -535,7 +538,9 @@ void IntervalAnalysis::addSuccessors(size_t nowLabel, States outputState) {
 namespace fdlang::analysis {
     Interval getIvFromValue(IR::Value *v, const States &input) {
         if (v->isNumber()) {
-            Interval iv; iv.isBottom = false; iv.l = iv.r = v->getAsNumber();
+            Interval iv; 
+            iv.isBottom = false; 
+            iv.l = iv.r = v->getAsNumber();
             if (iv.l < 0) iv.l = 0;
             if (iv.r > 255) iv.r = 255;
             return iv;
@@ -547,30 +552,40 @@ namespace fdlang::analysis {
     }
 
     void clampInterval(Interval &iv) {
-        if (iv.isBottom) return;
+        if (iv.isBottom) {
+            return;
+        }
         if (iv.l < 0) iv.l = 0;
         if (iv.r > 255) iv.r = 255;
     }
 
     Interval addInterval(const Interval &a, const Interval &b) {
-        if (a.isBottom || b.isBottom) return Interval();
-        Interval res; res.isBottom = false;
+        if (a.isBottom || b.isBottom) {
+            return Interval();
+        }
+        Interval res; 
+        res.isBottom = false;
         long long nl = a.l + b.l;
         long long nr = a.r + b.r;
         if (nl < 0) nl = 0;
         if (nr > 255) nr = 255;
-        res.l = nl; res.r = nr;
+        res.l = nl; 
+        res.r = nr;
         return res;
     }
 
     Interval subInterval(const Interval &a, const Interval &b) {
-        if (a.isBottom || b.isBottom) return Interval();
-        Interval res; res.isBottom = false;
+        if (a.isBottom || b.isBottom) {
+            return Interval();
+        }
+        Interval res; 
+        res.isBottom = false;
         long long nl = a.l - b.r;
         long long nr = a.r - b.l;
         if (nl < 0) nl = 0;
         if (nr > 255) nr = 255;
-        res.l = nl; res.r = nr;
+        res.l = nl; 
+        res.r = nr;
         return res;
     }
 } // namespace fdlang::analysis
