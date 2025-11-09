@@ -538,16 +538,20 @@ void IntervalAnalysis::addSuccessors(size_t nowLabel, States outputState) {
 namespace fdlang::analysis {
     Interval getIvFromValue(IR::Value *v, const States &input) {
         if (v->isNumber()) {
-            Interval iv; 
-            iv.isBottom = false; 
-            iv.l = iv.r = v->getAsNumber();
-            if (iv.l < 0) iv.l = 0;
-            if (iv.r > 255) iv.r = 255;
+			Interval iv;
+			iv.isBottom = false;
+			long long val = v->getAsNumber();
+			iv.l = val;
+			iv.r = val;
+			if (iv.l < 0) iv.l = 0;
+			if (iv.r > 255) iv.r = 255;
             return iv;
         }
         std::string name = v->getAsVariable();
         auto it = input.find(name);
-        if (it == input.end()) return Interval();
+        if (it == input.end()) {
+            return Interval();
+        }
         return it->second;
     }
 
