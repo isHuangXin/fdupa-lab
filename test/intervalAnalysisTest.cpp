@@ -74,6 +74,8 @@ void compare(const std::string &our, const std::string &expected) {
 void check(std::string &filepath) {
     std::string src = readSrc(TESTCASES_DIR "/" + filepath);
     std::string expected = readSrc(TESTCASES_DIR "/" + filepath + ".expected");
+    // std::string src = readSrc(TESTCASES_DIR_MYSELF "/" + filepath);
+    // std::string expected = readSrc(TESTCASES_DIR_MYSELF "/" + filepath + ".expected");
     std::stringstream result;
 
     fdlang::Scanner scanner(src);
@@ -106,6 +108,12 @@ TEST(IntervalAnalysis, RunAll) {
         "loop5.fdlang",     "nobranch1.fdlang", "nobranch2.fdlang",
         "nobranch3.fdlang", "rel1.fdlang",      "rel2.fdlang",
         "rel3.fdlang",      "rel4.fdlang"};
+
+    // std::vector<std::string> files = {
+    //     "simple_loop_widening.fdlang",
+    //     "subtraction_clipping.fdlang",
+    //     "unreachable_branch.fdlang"
+    // };
 
     for (auto &filepath : files)
         check(filepath);
