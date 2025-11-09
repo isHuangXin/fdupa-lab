@@ -14,7 +14,9 @@ void IntervalAnalysis::fixedPoint() {
 	States initState = iniStates();
 	// bottom state: all variables bottom
 	States bottomState = initState;
-	for (auto &p : bottomState) p.second = Interval();
+	for (auto &p : bottomState) {
+        p.second = Interval();
+    }
 
 	// initialize all labels to bottom, entry to init
 	for (auto *inst : insts) {
@@ -22,22 +24,24 @@ void IntervalAnalysis::fixedPoint() {
 		size_t lbl = inst->getLabel();
 		inputStates[lbl] = bottomState;
 	}
+
 	if (!insts.empty()) {
         inputStates[insts[0]->getLabel()] = initState;
     }
 
-	while (!worklist.empty()) worklist.pop();
-	if (!insts.empty()) {
+    // initialize worklist
+	while (!worklist.empty()) {
+        worklist.pop();
+    }
+    if (!insts.empty()) {
         worklist.push(insts[0]->getLabel());
-	}
+    }
 
 	// simple driver: compute transfer and delegate successor handling
 	while (!worklist.empty()) {
-		size_t label = worklist.front();
-		worklist.pop();
-
-		// find inst by label (safe lookup)
-		IR::Inst *inst = nullptr;
+        size_t label = worklist.front();
+        worklist.pop();
+        IR::Inst *inst = nullptr;
 		if (label < insts.size() && insts[label] && insts[label]->getLabel() == label) {
 			inst = insts[label];
 		} else {
@@ -322,47 +326,7 @@ States IntervalAnalysis::iniStates() {
 States IntervalAnalysis::transfer(IR::Inst *inst, States &input) {
 	States out = input; // default copy
 
-	auto getIv = [&](IR::Value *v) -> Interval {
-		if (v->isNumber()) {
-			Interval iv; iv.isBottom = false; iv.l = iv.r = v->getAsNumber();
-			if (iv.l < 0) iv.l = 0;
-			if (iv.r > 255) iv.r = 255;
-			return iv;
-		}
-		std::string name = v->getAsVariable();
-		auto it = input.find(name);
-		if (it == input.end()) return Interval();
-		return it->second;
-	};
-
-	auto clamp = [&](Interval &iv) {
-		if (iv.isBottom) return;
-		if (iv.l < 0) iv.l = 0;
-		if (iv.r > 255) iv.r = 255;
-	};
-
-	auto addIv = [&](const Interval &a, const Interval &b) -> Interval {
-		if (a.isBottom || b.isBottom) return Interval();
-		Interval res; res.isBottom = false;
-		long long nl = a.l + b.l;
-		long long nr = a.r + b.r;
-		if (nl < 0) nl = 0;
-		if (nr > 255) nr = 255;
-		res.l = nl; res.r = nr;
-		return res;
-	};
-
-	auto subIv = [&](const Interval &a, const Interval &b) -> Interval {
-		if (a.isBottom || b.isBottom) return Interval();
-		Interval res; res.isBottom = false;
-		long long nl = a.l - b.r;
-		long long nr = a.r - b.l;
-		if (nl < 0) nl = 0;
-		if (nr > 255) nr = 255;
-		res.l = nl; res.r = nr;
-		return res;
-	};
-
+	// Use helper functions defined above.
 	switch (inst->getInstType()) {
         case IR::InstType::InputInst: {
             IR::Value *dst = inst->getOperand(0);
@@ -375,7 +339,7 @@ States IntervalAnalysis::transfer(IR::Inst *inst, States &input) {
             IR::Value *dst = inst->getOperand(0);
             IR::Value *src = inst->getOperand(1);
             std::string name = dst->getAsVariable();
-            Interval rhs = getIv(src);
+			Interval rhs = getIvFromValue(src, input);
             out[name] = rhs;
             break;
         }
@@ -383,10 +347,10 @@ States IntervalAnalysis::transfer(IR::Inst *inst, States &input) {
             IR::Value *dst = inst->getOperand(0);
             IR::Value *l = inst->getOperand(1);
             IR::Value *r = inst->getOperand(2);
-            Interval li = getIv(l);
-            Interval ri = getIv(r);
-            Interval res = addIv(li, ri);
-            clamp(res);
+			Interval li = getIvFromValue(l, input);
+			Interval ri = getIvFromValue(r, input);
+			Interval res = addInterval(li, ri);
+			clampInterval(res);
             out[dst->getAsVariable()] = res;
             break;
         }
@@ -394,10 +358,10 @@ States IntervalAnalysis::transfer(IR::Inst *inst, States &input) {
             IR::Value *dst = inst->getOperand(0);
             IR::Value *l = inst->getOperand(1);
             IR::Value *r = inst->getOperand(2);
-            Interval li = getIv(l);
-            Interval ri = getIv(r);
-            Interval res = subIv(li, ri);
-            clamp(res);
+			Interval li = getIvFromValue(l, input);
+			Interval ri = getIvFromValue(r, input);
+			Interval res = subInterval(li, ri);
+			clampInterval(res);
             out[dst->getAsVariable()] = res;
             break;
         }
@@ -565,3 +529,48 @@ void IntervalAnalysis::addSuccessors(size_t nowLabel, States outputState) {
             worklist.push(lab);
 	}
 }
+
+
+// Helper functions to transfer()
+namespace fdlang::analysis {
+    Interval getIvFromValue(IR::Value *v, const States &input) {
+        if (v->isNumber()) {
+            Interval iv; iv.isBottom = false; iv.l = iv.r = v->getAsNumber();
+            if (iv.l < 0) iv.l = 0;
+            if (iv.r > 255) iv.r = 255;
+            return iv;
+        }
+        std::string name = v->getAsVariable();
+        auto it = input.find(name);
+        if (it == input.end()) return Interval();
+        return it->second;
+    }
+
+    void clampInterval(Interval &iv) {
+        if (iv.isBottom) return;
+        if (iv.l < 0) iv.l = 0;
+        if (iv.r > 255) iv.r = 255;
+    }
+
+    Interval addInterval(const Interval &a, const Interval &b) {
+        if (a.isBottom || b.isBottom) return Interval();
+        Interval res; res.isBottom = false;
+        long long nl = a.l + b.l;
+        long long nr = a.r + b.r;
+        if (nl < 0) nl = 0;
+        if (nr > 255) nr = 255;
+        res.l = nl; res.r = nr;
+        return res;
+    }
+
+    Interval subInterval(const Interval &a, const Interval &b) {
+        if (a.isBottom || b.isBottom) return Interval();
+        Interval res; res.isBottom = false;
+        long long nl = a.l - b.r;
+        long long nr = a.r - b.l;
+        if (nl < 0) nl = 0;
+        if (nr > 255) nr = 255;
+        res.l = nl; res.r = nr;
+        return res;
+    }
+} // namespace fdlang::analysis
