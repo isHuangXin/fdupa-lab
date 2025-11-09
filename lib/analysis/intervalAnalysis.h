@@ -24,6 +24,9 @@ struct Interval {
 // variable -> value
 using States = std::map<std::string, Interval>;
 
+// Helper functions to checkInstsStates()
+bool isAllBottom(const States &st);
+
 // Helper functions to transfer()
 Interval getIvFromValue(IR::Value *v, const States &input);
 void clampInterval(Interval &iv);
