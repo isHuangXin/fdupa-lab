@@ -74,7 +74,13 @@ ZoneDomain ZoneDomain::normalize() const {
     ZoneDomain ret = *this;
 
     // todo: Floyd (about 4 lines)
-
+    for (size_t i = 0; i < n; i++) {
+        for (size_t j = 0; j < n; j++) {
+            for (size_t k = 0; k < n; k++) {
+                ret._dbm[i][j] = std::min(ret._dbm[i][j], ret._dbm[i][k] + ret._dbm[k][j]);
+            }
+        }
+    }
     return ret;
 }
 
@@ -84,7 +90,11 @@ ZoneDomain ZoneDomain::normalize() const {
 bool ZoneDomain::isEmpty() const {
 
     // todo: Determine if there are negative loops (about 4 lines)
-
+    for (size_t i = 0; i < n; i++) {
+        if (_dbm[i][i] < 0) {
+            return true;
+        }
+    }
     return false;
 }
 
@@ -231,7 +241,9 @@ ZoneDomain ZoneDomain::filter(const std::string &x, const std::string &y,
     ZoneDomain ret = *this;
 
     // todo: add constraint `x - y <= c' (about 3 lines)
-
+    size_t j = getID(x);
+    size_t i = getID(y);
+    ret._dbm[i][j] = std::min(ret._dbm[i][j], c);
     return ret;
 }
 
@@ -382,7 +394,7 @@ ZoneDomain ZoneDomain::assign_case2(const std::string &x, const std::string &y,
     ZoneDomain ret;
 
     // todo: (about 1 line)
-
+    ret = forget(x).filter(x, y, c).filter(y, x, -c);
     return ret;
 }
 
@@ -396,6 +408,9 @@ ZoneDomain ZoneDomain::assign_case3(const std::string &x, long long l,
     ZoneDomain ret;
 
     // todo: (about 4 lines)
-
+    size_t i0 = getID(x);
+    ret = forget(x);
+    ret._dbm[0][i0] = r;
+    ret._dbm[i0][0] = -l;
     return ret;
 }
